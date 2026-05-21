@@ -115,6 +115,7 @@ def _tasks_reducer(
     update: dict[str, AsyncTask],
 ) -> dict[str, AsyncTask]:
     """Merge task updates into the existing tasks dict."""
+    # async_tasks 以 task_id 为 key;每个工具调用只提交变化的任务记录.
     merged = dict(existing or {})
     merged.update(update)
     return merged
@@ -224,6 +225,7 @@ def _resolve_headers(spec: AsyncSubAgent) -> dict[str, str]:
     """
     headers: dict[str, str] = dict(spec.get("headers") or {})
     if "x-auth-scheme" not in headers:
+        # LangGraph Platform/LangSmith 默认需要该认证提示,自托管服务通常会忽略它.
         headers["x-auth-scheme"] = "langsmith"
     return headers
 
@@ -238,12 +240,14 @@ class _ClientCache:
 
     def _cache_key(self, spec: AsyncSubAgent) -> tuple[str | None, frozenset[tuple[str, str]]]:
         """Build a cache key from the agent spec's url and resolved headers."""
+        # 同一远端地址但 header 不同时不能复用 client,避免认证上下文串线.
         return (spec.get("url"), frozenset(_resolve_headers(spec).items()))
 
     def get_sync(self, name: str) -> SyncLangGraphClient:
         """Get or create a sync client for the named agent."""
         spec = self._agents[name]
         if spec.get("url") is None:
+            # 同步 SDK 不支持 url=None 的本地 ASGI transport,因此只允许异步路径使用.
             msg = f"Async subagent '{name}' has no url configured. ASGI transport (url=None) requires async invocation."
             raise ValueError(msg)
         key = self._cache_key(spec)
@@ -303,6 +307,7 @@ def _build_start_tool(
             return f"Failed to launch async subagent '{subagent_type}': {e}"
         task_id = thread["thread_id"]
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # 本地 task_id 直接使用远端 thread_id;当前 run_id 指向正在执行的那次 run.
         task: AsyncTask = {
             "task_id": task_id,
             "agent_name": subagent_type,
@@ -343,6 +348,7 @@ def _build_start_tool(
             return f"Failed to launch async subagent '{subagent_type}': {e}"
         task_id = thread["thread_id"]
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # 异步启动同样把 thread_id 作为稳定 task_id,便于跨轮次查询.
         task: AsyncTask = {
             "task_id": task_id,
             "agent_name": subagent_type,
@@ -385,6 +391,7 @@ def _build_check_result(
         messages = thread_values.get("messages", []) if isinstance(thread_values, dict) else []
         if messages:
             last = messages[-1]
+            # 远端成功后只取最后一条消息内容作为父 agent 可消费的结果摘要.
             result["result"] = last.get("content", "") if isinstance(last, dict) else str(last)
         else:
             result["result"] = "(completed with no output messages)"
@@ -401,6 +408,7 @@ def _build_check_command(
 ) -> Command:
     """Build the `Command` update for a check result."""
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # last_updated_at 只在状态变化时更新;last_checked_at 每次查询都会刷新.
     last_updated_at = now if task["status"] != result["status"] else task["last_updated_at"]
     updated_task = AsyncTask(
         task_id=task["task_id"],
@@ -430,6 +438,7 @@ def _resolve_tracked_task(
         The tracked `AsyncTask` on success, or an error string.
     """
     tasks: dict[str, AsyncTask] = runtime.state.get("async_tasks") or {}
+    # 用户可能复制 task_id 时带空白,查询前做轻量 normalize.
     tracked = tasks.get(task_id.strip())
     if not tracked:
         return f"No tracked task found for task_id: {task_id!r}"
@@ -524,6 +533,7 @@ def _build_update_tool(
         spec = agent_map[tracked["agent_name"]]
         try:
             client = clients.get_sync(tracked["agent_name"])
+            # update 不是新建任务,而是在同一 thread 上 interrupt 当前 run 并启动新 run.
             run = client.runs.create(
                 thread_id=tracked["thread_id"],
                 assistant_id=spec["graph_id"],
@@ -563,6 +573,7 @@ def _build_update_tool(
         spec = agent_map[tracked["agent_name"]]
         try:
             client = clients.get_async(tracked["agent_name"])
+            # task_id 保持不变,只有 run_id 指向新的远端执行.
             run = await client.runs.create(
                 thread_id=tracked["thread_id"],
                 assistant_id=spec["graph_id"],
@@ -686,6 +697,7 @@ def _build_cancel_tool(
 
 _TERMINAL_STATUSES = frozenset({"cancelled", "success", "error", "timeout", "interrupted"})
 """Task statuses that will never change, so live-status fetches can be skipped."""
+# 终态任务不再访问远端,减少 list_async_tasks 的网络开销和失败面.
 
 
 def _fetch_live_status(clients: _ClientCache, task: AsyncTask) -> str:
@@ -751,6 +763,7 @@ def _filter_tasks(
     """
     if not status_filter or status_filter == "all":
         return list(tasks.values())
+    # 先按缓存状态过滤,再拉实时状态;这样 status_filter 的语义稳定且成本可控.
     return [task for task in tasks.values() if task["status"] == status_filter]
 
 
@@ -772,6 +785,7 @@ def _build_list_tasks_tool(clients: _ClientCache) -> StructuredTool:
             status = _fetch_live_status(clients, task)
             entries.append(_format_task_entry(task, status))
             last_updated_at = now if status != task["status"] else task["last_updated_at"]
+            # list 工具不返回完整结果,只刷新状态摘要;结果读取交给 check_async_task.
             updated_tasks[task["task_id"]] = AsyncTask(
                 task_id=task["task_id"],
                 agent_name=task["agent_name"],
@@ -805,6 +819,7 @@ def _build_list_tasks_tool(clients: _ClientCache) -> StructuredTool:
         for task, status in zip(filtered, statuses, strict=True):
             entries.append(_format_task_entry(task, status))
             last_updated_at = now if status != task["status"] else task["last_updated_at"]
+            # 异步列表路径并发刷新 live status,避免多个远端任务串行等待.
             updated_tasks[task["task_id"]] = AsyncTask(
                 task_id=task["task_id"],
                 agent_name=task["agent_name"],
@@ -920,6 +935,7 @@ class AsyncSubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
         names = [a["name"] for a in async_subagents]
         dupes = {n for n in names if names.count(n) > 1}
         if dupes:
+            # 工具调用只传 subagent_type,名称重复会让远端 graph 映射不可判定.
             msg = f"Duplicate async subagent names: {dupes}"
             raise ValueError(msg)
 

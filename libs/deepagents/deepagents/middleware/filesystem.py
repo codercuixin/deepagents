@@ -91,6 +91,7 @@ class FilesystemPermission:
     def __post_init__(self) -> None:
         """Validate permission path patterns."""
         for path in self.paths:
+            # 权限规则统一使用虚拟 POSIX 绝对路径,避免相对路径和平台差异造成绕过.
             if not path.startswith("/"):
                 msg = f"Permission path must start with '/': {path!r}"
                 raise ValueError(msg)
@@ -108,6 +109,7 @@ def _check_fs_permission(
     operation: FilesystemOperation,
     path: str,
 ) -> Literal["allow", "deny"]:
+    # 规则按声明顺序匹配,第一条命中即返回;没有命中时默认允许.
     for rule in rules:
         if operation not in rule.operations:
             continue
@@ -137,6 +139,7 @@ def _all_paths_scoped_to_routes(
     if not route_prefixes:
         return False
 
+    # 带执行能力的 backend 暂不支持命令级路径权限;只有规则完全限定在非默认路由时才允许.
     for rule in rules:
         for path in rule.paths:
             if not any(path.startswith(prefix) for prefix in route_prefixes):
@@ -248,6 +251,7 @@ def _file_data_delta_reducer(
     DeltaChannel calls reducer(base, list(values)) where values is a list of
     all writes in the current step. Single dict copy + one pass over all writes.
     """
+    # DeltaChannel 会批量合并本轮写入;None 仍保留"删除该路径"的语义.
     result: dict[str, FileData] = dict(left) if left else {}
     for writes in values:
         for key, value in writes.items():
@@ -491,6 +495,7 @@ def supports_execution(backend: BackendProtocol) -> bool:
     Returns:
         True if the backend supports execution, False otherwise.
     """
+    # CompositeBackend 的 execute 只能走 default backend;route backend 支持执行并不代表整体可执行.
     # For CompositeBackend, check the default backend
     if isinstance(backend, CompositeBackend):
         return isinstance(backend.default, SandboxBackendProtocol)
@@ -528,6 +533,7 @@ TOOLS_EXCLUDED_FROM_EVICTION = (
     "edit_file",
     "write_file",
 )
+# read_file/search/write/edit 这些内置工具各有自己的截断或小输出策略,不走通用结果落盘.
 
 
 TOO_LARGE_HUMAN_MSG = """Message content too large and was saved to the filesystem at: {file_path}
@@ -693,6 +699,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             and supports_execution(self.backend)
             and not _all_paths_scoped_to_routes(_permissions, self.backend)
         ):
+            # shell 命令可自行访问任意路径;路径权限尚不能约束 execute 内部行为,因此提前拒绝危险组合.
             msg = (
                 "FilesystemMiddleware does not yet support permissions with backends that "
                 "provide command execution (SandboxBackendProtocol). Tool-level permissions "
@@ -703,6 +710,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
 
         artifacts_root = self.backend.artifacts_root if isinstance(self.backend, CompositeBackend) else "/"
         _root = artifacts_root.rstrip("/")
+        # 大工具结果和大用户消息都写到 artifacts_root 下,便于 CompositeBackend 做持久化分流.
         self._large_tool_results_prefix = f"{_root}/large_tool_results"
         self._conversation_history_prefix = f"{_root}/conversation_history"
 
@@ -847,10 +855,12 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         def _truncate(content: str, file_path: str, limit: int) -> str:
             lines = content.splitlines(keepends=True)
             if len(lines) > limit:
+                # 先按显示行数分页,防止 read_file 一次把大文件塞进上下文.
                 lines = lines[:limit]
                 content = "".join(lines)
 
             if token_limit and len(content) >= NUM_CHARS_PER_TOKEN * token_limit:
+                # 再按近似 token 预算裁剪,处理少量超长行导致的上下文膨胀.
                 truncation_msg = READ_FILE_TRUNCATION_MSG.format(file_path=file_path)
                 max_content_length = NUM_CHARS_PER_TOKEN * token_limit - len(truncation_msg)
                 content = content[:max_content_length] + truncation_msg
@@ -865,6 +875,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             limit: int,
         ) -> ToolMessage:
             if isinstance(read_result, str):
+                # 兼容旧 backend:它们返回的字符串已经带行号,只补截断逻辑.
                 warn_deprecated(
                     since="0.5.0",
                     removal="0.7.0",
@@ -903,6 +914,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             content = read_result.file_data["content"]
 
             if file_type != "text":
+                # 非文本文件作为多模态 content block 返回,让模型/客户端按媒体类型处理.
                 mime_type = mimetypes.guess_type("file" + Path(validated_path).suffix)[0] or "application/octet-stream"
                 return ToolMessage(
                     content_blocks=cast("list[ContentBlock]", [{"type": file_type, "base64": content, "mime_type": mime_type}]),
@@ -924,6 +936,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             content = format_content_with_line_numbers(content, start_line=offset + 1)
             # We apply truncation again after formatting content as continuation lines
             # can increase line count
+            # 加行号和长行 continuation 后行数可能变化,所以格式化后再执行一次截断.
             return ToolMessage(
                 content=_truncate(content, validated_path, limit),
                 name="read_file",
@@ -1211,6 +1224,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                 )
             ctx = contextvars.copy_context()
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                # 同步 backend.glob 无法直接取消,用单线程等待来给模型一个可控超时.
                 future = executor.submit(lambda: ctx.run(resolved_backend.glob, pattern, path=validated_path))
                 try:
                     glob_result = future.result(timeout=GLOB_TIMEOUT)
@@ -1261,6 +1275,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     status="error",
                 )
             try:
+                # 异步 backend 直接用 wait_for 限时,避免宽泛 glob 长时间占住 agent.
                 glob_result = await asyncio.wait_for(
                     resolved_backend.aglob(pattern, path=validated_path),
                     timeout=GLOB_TIMEOUT,
@@ -1339,6 +1354,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     status="error",
                 )
             matches = grep_result.matches or []
+            # 即使未指定 path,也要按每条 match 的真实路径二次过滤,避免搜索结果泄露 deny 路径.
             filtered_matches = _filter_grep_matches_by_permission(self._permissions, matches, operation="read")
             formatted = format_grep_matches(filtered_matches, output_mode)
             return ToolMessage(
@@ -1386,6 +1402,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     status="error",
                 )
             matches = grep_result.matches or []
+            # 异步 grep 与同步 grep 保持同样的结果级权限过滤.
             filtered_matches = _filter_grep_matches_by_permission(self._permissions, matches, operation="read")
             formatted = format_grep_matches(filtered_matches, output_mode)
             return ToolMessage(
@@ -1436,6 +1453,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             resolved_backend = self._get_backend(runtime)
 
             # Runtime check - fail gracefully if not supported
+            # 工具可能被手动保留在列表里;执行前仍要按实际 backend 能力兜底检查.
             if not supports_execution(resolved_backend):
                 return ToolMessage(
                     content=(
@@ -1526,6 +1544,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             resolved_backend = self._get_backend(runtime)
 
             # Runtime check - fail gracefully if not supported
+            # 异步执行路径同样运行时确认 backend,避免模型看到不可用的 execute 后硬失败.
             if not supports_execution(resolved_backend):
                 return ToolMessage(
                     content=(
@@ -1624,6 +1643,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
 
         backend_supports_execution = False
         if has_execute_tool:
+            # 模型调用前按当前 runtime backend 动态隐藏 execute,系统提示也随之调整.
             # Resolve backend to check execution support
             backend = self._get_backend(request.runtime)  # ty: ignore[invalid-argument-type]
             backend_supports_execution = supports_execution(backend)
@@ -1657,6 +1677,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
 
         eviction_result = self._evict_and_truncate_messages(request)
         if eviction_result is not None:
+            # state 保留完整用户消息;真正发给模型的是带文件路径和预览的轻量消息.
             messages, state_command = eviction_result
             request = request.override(messages=messages)
             response = handler(request)
@@ -1689,6 +1710,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
 
         backend_supports_execution = False
         if has_execute_tool:
+            # 异步路径同样在每次请求时按 backend 能力决定是否暴露 execute.
             # Resolve backend to check execution support
             backend = self._get_backend(request.runtime)  # ty: ignore[invalid-argument-type]
             backend_supports_execution = supports_execution(backend)
@@ -1722,6 +1744,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
 
         eviction_result = await self._aevict_and_truncate_messages(request)
         if eviction_result is not None:
+            # 新落盘的人类消息通过 ExtendedModelResponse 写回标签,避免后续重复落盘.
             messages, state_command = eviction_result
             request = request.override(messages=messages)
             response = await handler(request)
@@ -1760,6 +1783,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         content_str = _extract_text_from_message(message)
 
         # Check if content exceeds eviction threshold
+        # 用字符数近似 token 数,超过阈值才把工具结果写入 large_tool_results.
         if len(content_str) <= NUM_CHARS_PER_TOKEN * self._tool_token_limit_before_evict:
             return message, False
 
@@ -1884,6 +1908,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
 
         if write_result is not None and file_path is not None and not write_result.error:
             last = messages[-1]
+            # 给消息补稳定 id 并打 lc_evicted_to 标签,使后续轮次能只发送预览.
             tagged = last.model_copy(
                 update={
                     "id": last.id if last.id is not None else str(uuid.uuid4()),
@@ -1998,6 +2023,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                     processed_messages.append(message)
                     continue
 
+                # Command 可能一次返回多条消息;只处理其中的 ToolMessage,保留其它 state 更新.
                 processed_message, _evicted = self._process_large_message(
                     message,
                     resolved_backend,
@@ -2059,6 +2085,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         tool_result = handler(request)
 
         if self._tool_token_limit_before_evict is None or request.tool_call["name"] in TOOLS_EXCLUDED_FROM_EVICTION:
+            # 内置小输出/自带截断工具跳过通用 eviction,保持其专门的恢复提示.
             return tool_result
 
         return self._intercept_large_tool_result(tool_result, request.runtime)
@@ -2080,6 +2107,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         tool_result = await handler(request)
 
         if self._tool_token_limit_before_evict is None or request.tool_call["name"] in TOOLS_EXCLUDED_FROM_EVICTION:
+            # 与同步路径一致:排除工具不做额外落盘,避免 read_file 等恢复路径变复杂.
             return tool_result
 
         return await self._aintercept_large_tool_result(tool_result, request.runtime)

@@ -48,10 +48,12 @@ def _create_content_preview(content_str: str, *, head_lines: int = 5, tail_lines
     lines = content_str.splitlines()
 
     if len(lines) <= head_lines + tail_lines:
+        # 内容本身不长时仍按行号格式返回,保持和截断预览的展示形态一致.
         # If file is small enough, show all lines
         preview_lines = [line[:1000] for line in lines]
         return format_content_with_line_numbers(preview_lines, start_line=1)
 
+    # 只展示头尾,既保留定位线索,又避免把大结果重新塞回上下文窗口.
     # Show head and tail with truncation marker
     head = [line[:1000] for line in lines[:head_lines]]
     tail = [line[:1000] for line in lines[-tail_lines:]]
@@ -75,6 +77,7 @@ def _extract_text_from_message(message: BaseMessage) -> str:
     Returns:
         Joined text from all text content blocks, or stringified content as fallback.
     """
+    # 只统计文本块;图片,音频等媒体块不参与落盘阈值判断,也不会被误转成字符串.
     texts = [block["text"] for block in message.content_blocks if block["type"] == "text"]
     return "\n".join(texts)
 
@@ -99,6 +102,7 @@ def _build_evicted_content(message: ToolMessage, replacement_text: str) -> str |
     if not media_blocks:
         # All content is text, so a plain string replacement is sufficient.
         return replacement_text
+    # 多模态消息只替换文本内容,保留媒体块,让模型仍能看到非文本上下文.
     return [cast("ContentBlock", {"type": "text", "text": replacement_text}), *media_blocks]
 
 
@@ -131,6 +135,7 @@ def _offload_tool_message_content(
     """
     sanitized_id = sanitize_tool_call_id(message.tool_call_id) if message.tool_call_id else "unknown"
     file_path = f"{large_tool_results_prefix}/{sanitized_id}"
+    # 先写入后替换;写入失败时返回 None,让调用方保留原始 ToolMessage.
     result = backend.write(file_path, content_str)
     if result is None or result.error:
         return None

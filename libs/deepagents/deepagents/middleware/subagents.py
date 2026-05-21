@@ -238,6 +238,7 @@ _EXCLUDED_STATE_KEYS = {
     "skills_load_errors",
     "memory_contents",
 }
+# 这些 key 要么由父/子 agent 各自维护,要么没有安全的跨 agent reducer,不能直接透传.
 """State keys that are excluded when passing state to subagents and when
 returning updates from subagents.
 
@@ -447,6 +448,7 @@ def _subagent_tracing_context() -> Generator[None, None, None]:
     current = get_tracing_context()
 
     merged_metadata = {**(current.get("metadata") or {}), "ls_agent_type": "subagent"}
+    # 只追加 subagent 标记,其它 tracing 字段原样透传,避免打断父 run 的追踪链路.
     # Pass every field from the current tracing context through to
     # `tracing_context` so we don't accidentally clobber fields that may be
     # added to langsmith in the future. The only change is `metadata`.
@@ -494,10 +496,12 @@ def _build_task_tool(  # noqa: C901, PLR0915
             )
             raise ValueError(error_msg)
 
+        # 子 agent 的私有/消息状态不直接回流;只把明确可合并的 state key 带回父 agent.
         state_update = {k: v for k, v in result.items() if k not in _EXCLUDED_STATE_KEYS}
 
         structured = result.get("structured_response")
         if structured is not None:
+            # 结构化输出优先作为 task 工具结果,保证父 agent 收到机器可读内容.
             if hasattr(structured, "model_dump_json"):
                 content: str = structured.model_dump_json()
             elif dataclasses.is_dataclass(structured) and not isinstance(structured, type):
@@ -509,6 +513,7 @@ def _build_task_tool(  # noqa: C901, PLR0915
             # occasionally emits a trailing empty `end_turn` AIMessage after a
             # successful final tool call, which would otherwise be forwarded
             # as an empty ToolMessage.
+            # 倒序找最后一条非空 AIMessage,避免把 provider 的空收尾消息当作子任务结果.
             content = ""
             for msg in reversed(result["messages"]):
                 if isinstance(msg, AIMessage):
@@ -528,6 +533,7 @@ def _build_task_tool(  # noqa: C901, PLR0915
         """Prepare state for invocation."""
         subagent = subagent_graphs[subagent_type]
         # Create a new state dict to avoid mutating the original
+        # 子 agent 继承父状态中的共享上下文,但消息和私有中间件状态必须重新隔离.
         subagent_state = {k: v for k, v in runtime.state.items() if k not in _EXCLUDED_STATE_KEYS}
         subagent_state["messages"] = [HumanMessage(content=description)]
         return subagent, subagent_state
@@ -552,6 +558,7 @@ def _build_task_tool(  # noqa: C901, PLR0915
         config: RunnableConfig = {}
         for key in ("callbacks", "tags", "configurable"):
             if key in parent_config:
+                # 只转发流式回调,追踪标签和 configurable;metadata/recursion_limit 由子图自己的配置决定.
                 config[key] = parent_config[key]  # type: ignore[literal-required]
         return config
 
@@ -571,6 +578,7 @@ def _build_task_tool(  # noqa: C901, PLR0915
         # Tag the subagent's configurable so downstream readers (e.g. middleware
         # that key off `runtime.config["configurable"]["ls_agent_type"]`) see the
         # subagent context, in addition to the langsmith tracing-context tag.
+        # 同时写 configurable 和 tracing metadata,兼容不同层级读取 subagent 身份.
         subagent_config["configurable"] = {
             **subagent_config.get("configurable", {}),
             "ls_agent_type": "subagent",
@@ -708,6 +716,7 @@ class SubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
             if "runnable" in spec:
                 # Use with_config (not attribute mutation) so the original runnable is
                 # untouched and a shared instance can be registered under multiple names.
+                # 已编译子 agent 只绑定运行名/追踪名,不改动原 runnable 实例.
                 compiled = cast("CompiledSubAgent", spec)
                 runnable = compiled["runnable"].with_config({"metadata": {"lc_agent_name": compiled["name"]}, "run_name": compiled["name"]})
                 specs.append({"name": compiled["name"], "description": compiled["description"], "runnable": runnable})
@@ -724,6 +733,7 @@ class SubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
             # Resolve model if string
             from deepagents._models import resolve_model  # noqa: PLC0415
 
+            # resolve_model 可能触发较重依赖,保持在构建子 agent 时延迟导入.
             model = resolve_model(spec["model"])
 
             # Use middleware as provided (caller is responsible for building full stack)
@@ -731,6 +741,7 @@ class SubAgentMiddleware(AgentMiddleware[Any, ContextT, ResponseT]):
 
             interrupt_on = spec.get("interrupt_on")
             if interrupt_on:
+                # 子 agent 可单独启用 HITL,不影响父 agent 的工具审批策略.
                 middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
 
             specs.append(

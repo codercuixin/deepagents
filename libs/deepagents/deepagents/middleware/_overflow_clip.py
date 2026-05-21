@@ -44,6 +44,7 @@ def _derive_overflow_clip_threshold_tokens(keep: ContextSize, max_input_tokens: 
     if kind == "tokens":
         return int(value)
     if kind == "fraction":
+        # fraction 依赖模型 profile;拿不到窗口大小时退回保守的固定阈值.
         if max_input_tokens is None:
             return 5_000
         return int(max_input_tokens * value)
@@ -55,6 +56,7 @@ def _find_tail_tool_message_batch(messages: list[AnyMessage]) -> tuple[int, list
     if not messages or not isinstance(messages[-1], ToolMessage):
         return None
     i = len(messages) - 1
+    # 只裁剪尾部连续 ToolMessage 批次,避免破坏 AIMessage/tool response 的历史配对.
     while i >= 0 and isinstance(messages[i], ToolMessage):
         i -= 1
     start = i + 1
@@ -66,6 +68,7 @@ def _build_tool_call_index(messages: list[AnyMessage]) -> dict[str, dict[str, An
     index: dict[str, dict[str, Any]] = {}
     for m in messages:
         if isinstance(m, AIMessage):
+            # 后续需要反查 read_file 的原始 file_path,因此按 tool_call_id 建索引.
             for tc in m.tool_calls or []:
                 tcid = tc.get("id")
                 if tcid:
@@ -84,6 +87,7 @@ def _slice_read_file_tm(msg: ToolMessage, original_path: str) -> ToolMessage:
     or the middleware did.
     """
     content = _extract_text_from_message(msg)
+    # read_file 的完整内容本来就在原文件路径,不需要再写一份 large_tool_results.
     notice = (
         f"\n\n[Output was truncated due to context window size limits. "
         f"The full content is at {original_path}. "
@@ -111,6 +115,7 @@ def _clip_one_tail_message(
     """Apply the appropriate per-TM clip: read_file slice vs generic eviction."""
     original_path = _read_file_original_path(msg, tc_index)
     if original_path is not None:
+        # read_file 结果走轻量头部截断,其它工具结果走通用落盘替换.
         return _slice_read_file_tm(msg, original_path)
     return _offload_tool_message_content(msg, _extract_text_from_message(msg), backend, large_tool_results_prefix)
 
@@ -154,6 +159,7 @@ def _clip_overflow_tail(
     if found is None:
         return preserved_messages, []
     start, tail = found
+    # 只有尾部工具结果足够大时才动手,避免为小结果制造额外文件和状态更新.
     if token_counter(tail) < _derive_overflow_clip_threshold_tokens(keep, max_input_tokens):
         return preserved_messages, []
     tc_index = _build_tool_call_index(preserved_messages)
@@ -163,6 +169,7 @@ def _clip_overflow_tail(
         r = _clip_one_tail_message(m, tc_index, backend, large_tool_results_prefix)
         if r is not None:
             if r.id is None:
+                # 给替换消息补 id,确保 LangGraph 的 add_messages reducer 能覆盖原消息.
                 r = r.model_copy(update={"id": str(uuid.uuid4())})
             new_tail.append(r)
             any_clipped = True
@@ -196,6 +203,7 @@ async def _aclip_overflow_tail(
     for r, m in zip(results, tail, strict=True):
         if r is not None:
             if r.id is None:
+                # 异步裁剪生成的替换消息也需要稳定 id,才能在状态里覆盖原 ToolMessage.
                 r = r.model_copy(update={"id": str(uuid.uuid4())})  # noqa: PLW2901
             new_tail.append(r)
             any_clipped = True

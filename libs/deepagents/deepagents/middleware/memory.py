@@ -293,6 +293,7 @@ class MemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
             State update with memory_contents populated.
         """
         # Skip if already loaded
+        # 记忆文件只在会话首次进入 agent 时加载;后续轮次直接复用私有 state.
         if "memory_contents" in state:
             return None
 
@@ -302,6 +303,7 @@ class MemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
         results = backend.download_files(list(self.sources))
         for path, response in zip(self.sources, results, strict=True):
             if response.error is not None:
+                # 缺失的 AGENTS.md 是正常情况;其他 backend 错误才应阻断启动.
                 if response.error == "file_not_found":
                     continue
                 msg = f"Failed to download {path}: {response.error}"
@@ -327,6 +329,7 @@ class MemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
             State update with memory_contents populated.
         """
         # Skip if already loaded
+        # 异步路径同样只加载一次,避免每次模型调用前重复访问 backend.
         if "memory_contents" in state:
             return None
 
@@ -336,6 +339,7 @@ class MemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
         results = await backend.adownload_files(list(self.sources))
         for path, response in zip(self.sources, results, strict=True):
             if response.error is not None:
+                # 找不到文件表示该层记忆未配置;非缺失错误通常说明 backend 状态异常.
                 if response.error == "file_not_found":
                     continue
                 msg = f"Failed to download {path}: {response.error}"
@@ -358,6 +362,7 @@ class MemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
         if self.system_prompt is None:
             new_system_message = request.system_message
         else:
+            # 这里不做 I/O,只把 before_agent 已放入 state 的内容格式化进系统提示.
             contents = request.state.get("memory_contents", {})
             agent_memory = self._format_agent_memory(contents, self.system_prompt)
             new_system_message = append_to_system_message(request.system_message, agent_memory)
@@ -372,6 +377,7 @@ class MemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
             and new_system_message is not None
             and new_system_message.content_blocks
         ):
+            # Anthropic prompt caching 需要在最终系统块上打断点;按运行时模型判断可兼容模型覆盖.
             blocks: list[ContentBlock] = list(new_system_message.content_blocks)
             last = blocks[-1]
             base = last if isinstance(last, dict) else {}

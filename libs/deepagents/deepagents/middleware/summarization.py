@@ -188,6 +188,7 @@ def compute_summarization_defaults(model: BaseChatModel) -> SummarizationDefault
     )
 
     if has_profile:
+        # 有模型上下文窗口信息时,用比例阈值随模型自动伸缩.
         return {
             "trigger": ("fraction", 0.85),
             "keep": ("fraction", 0.10),
@@ -199,6 +200,7 @@ def compute_summarization_defaults(model: BaseChatModel) -> SummarizationDefault
 
     # Defaults for models without profile info are more conservative to avoid
     # overshooting context limits.
+    # 没有 profile 时退回保守固定值,避免误判窗口大小后直接触发 provider overflow.
     return {
         "trigger": ("tokens", 170000),
         "keep": ("messages", 6),
@@ -311,10 +313,12 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
         )
 
         # Deep Agents specific attributes
+        # LangChain helper 负责摘要算法,Deep Agents 负责历史 offload 和状态事件管理.
         self._backend = backend
 
         artifacts_root = backend.artifacts_root if isinstance(backend, CompositeBackend) else "/"
         _root = artifacts_root.rstrip("/")
+        # 与 FilesystemMiddleware 使用相同 artifacts_root,方便 agent 通过 read_file 找回历史.
         self._history_path_prefix = f"{_root}/conversation_history"
         self._large_tool_results_prefix = f"{_root}/large_tool_results"
 
@@ -328,6 +332,7 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
             self._max_arg_length = 2000
             self._truncation_text = "...(argument truncated)"
         else:
+            # 只截旧工具参数,不改变最近 keep 窗口,避免影响模型刚产生的可执行调用.
             self._truncate_args_trigger = truncate_args_settings.get("trigger")
             self._truncate_args_keep = truncate_args_settings.get("keep", ("messages", 20))
             self._max_arg_length = truncate_args_settings.get("max_length", 2000)
@@ -391,6 +396,7 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
             # parameter, we access it via `runtime.config` instead.
             # Cast is safe: empty dict `{}` is a valid `RunnableConfig` (all fields are
             # optional in TypedDict).
+            # backend factory 仍需要 ToolRuntime,因此在模型调用钩子里临时构造一个.
             config = cast("RunnableConfig", getattr(runtime, "config", {}))
 
             tool_runtime = ToolRuntime(
@@ -424,6 +430,7 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
             pass
 
         # Fallback: generate session ID
+        # 没有 thread_id 时仍能 offload,但历史路径只在当前进程生成的 session 下稳定.
         generated_id = f"session_{uuid.uuid4().hex[:8]}"
         logger.debug("No thread_id found, using generated session ID: %s", generated_id)
         return generated_id
@@ -469,6 +476,7 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
         Returns:
             Messages without previous summary `HumanMessage` objects.
         """
+        # 链式摘要时旧 summary 只是索引入口,原始历史已在 backend,不需要重复落盘.
         return [msg for msg in messages if not self._is_summary_message(msg)]
 
     def _build_new_messages_with_path(self, summary: str, file_path: str | None) -> list[AnyMessage]:
@@ -484,6 +492,7 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
             List containing the summary `HumanMessage`.
         """
         if file_path is not None:
+            # 摘要消息携带历史路径,模型需要细节时可以通过 filesystem 工具分页读取.
             content = f"""\
 You are in the middle of a conversation that has been summarized.
 
@@ -544,10 +553,12 @@ A condensed summary follows:
             summary_msg = event["summary_message"]
             cutoff_idx = event["cutoff_index"]
         except (KeyError, TypeError) as exc:
+            # 私有事件损坏时宁可退回完整历史,也不要构造不可信的上下文.
             logger.warning("Malformed _summarization_event (missing keys): %s", exc)
             return list(messages)
 
         if cutoff_idx > len(messages):
+            # checkpoint 或外部状态变更可能让 cutoff 越界;此时保留摘要作为最小可用上下文.
             logger.warning(
                 "Summarization cutoff_index %d exceeds message count %d; remaining slice will be empty",
                 cutoff_idx,
@@ -556,6 +567,7 @@ A condensed summary follows:
             return [summary_msg]
 
         result: list[AnyMessage] = [summary_msg]
+        # 模型实际看到的是"摘要 + 未被摘要的尾部原始消息",state["messages"] 本身不被清空.
         result.extend(messages[cutoff_idx:])
         return result
 
@@ -585,6 +597,7 @@ A condensed summary follows:
         if not isinstance(prior_cutoff, int):
             logger.warning("Malformed _summarization_event: missing cutoff_index")
             return effective_cutoff
+        # effective list 的第 0 条是虚拟摘要消息,不对应原始 state,因此映射回 state 时要减 1.
         return prior_cutoff + effective_cutoff - 1
 
     def _should_truncate_args(self, messages: list[AnyMessage], total_tokens: int) -> bool:
@@ -609,6 +622,7 @@ A condensed summary follows:
         if trigger_type == "fraction":
             max_input_tokens = self._get_profile_limits()
             if max_input_tokens is None:
+                # 没有模型窗口信息时无法计算比例阈值,直接跳过参数截断.
                 return False
             threshold = int(max_input_tokens * trigger_value)
             if threshold <= 0:
@@ -644,6 +658,7 @@ A condensed summary follows:
                 max_input_tokens = self._get_profile_limits()
                 if max_input_tokens is None:
                     # Fallback to message count if profile not available
+                    # fraction keep 依赖 profile;缺失时退回最近 20 条,保证行为可预期.
                     messages_to_keep = 20
                     if len(messages) <= messages_to_keep:
                         return len(messages)
@@ -657,6 +672,7 @@ A condensed summary follows:
 
             # Keep recent messages up to token limit
             tokens_kept = 0
+            # 从尾部向前累计,保证最新上下文完整保留.
             for i in range(len(messages) - 1, -1, -1):
                 msg_tokens = self._lc_helper._partial_token_counter([messages[i]])
                 if tokens_kept + msg_tokens > target_token_count:
@@ -682,6 +698,7 @@ A condensed summary follows:
 
         for key, value in args.items():
             if isinstance(value, str) and len(value) > self._max_arg_length:
+                # 保留少量前缀便于识别参数类型,其余用固定提示替换.
                 truncated_args[key] = value[:20] + self._truncation_text
                 modified = True
             else:
@@ -715,6 +732,7 @@ A condensed summary follows:
         try:
             total_tokens = self.token_counter(counted_messages, tools=tools)  # ty: ignore[unknown-argument]
         except TypeError:
+            # 兼容旧 token_counter 签名:有些实现不接受 tools 参数.
             total_tokens = self.token_counter(counted_messages)
         if not self._should_truncate_args(messages, total_tokens):
             return messages, False
@@ -735,6 +753,7 @@ A condensed summary follows:
 
                 for tool_call in msg.tool_calls:
                     if tool_call["name"] in {"write_file", "edit_file"}:
+                        # 当前只截断最常见的大参数来源:写文件内容和编辑补丁.
                         truncated_call = self._truncate_tool_call(tool_call)  # ty: ignore[invalid-argument-type]
                         if truncated_call != tool_call:
                             msg_modified = True
@@ -791,6 +810,7 @@ A condensed summary follows:
         # line-numbered content (for LLM consumption), but edit() expects raw content.
         existing_content = ""
         try:
+            # 使用 download_files 读取原文;read() 面向模型展示,会注入行号,不适合 edit.
             responses = backend.download_files([path])
             if responses and responses[0].content is not None and responses[0].error is None:
                 existing_content = responses[0].content.decode("utf-8")
@@ -809,6 +829,7 @@ A condensed summary follows:
             result = backend.edit(path, existing_content, combined_content) if existing_content else backend.write(path, combined_content)
             if result is None or result.error:
                 error_msg = result.error if result else "backend returned None"
+                # offload 失败不阻断摘要;代价是摘要消息无法提供完整历史恢复路径.
                 logger.warning(
                     "Failed to offload conversation history to %s (%d messages): %s",
                     path,
@@ -865,6 +886,7 @@ A condensed summary follows:
         # line-numbered content (for LLM consumption), but edit() expects raw content.
         existing_content = ""
         try:
+            # 异步路径同样读取 backend 原始字节,避免把带行号内容写回历史文件.
             responses = await backend.adownload_files([path])
             if responses and responses[0].content is not None and responses[0].error is None:
                 existing_content = responses[0].content.decode("utf-8")
@@ -941,9 +963,11 @@ A condensed summary follows:
                 `_summarization_event` update is emitted.
         """
         # Get effective messages based on previous summarization events
+        # 先把完整 state 历史映射成模型实际上下文:旧摘要 + 未摘要尾部.
         effective_messages = self._get_effective_messages(request)
 
         # Step 1: Truncate args if configured
+        # 参数截断是低成本预处理,可能在不真正摘要的情况下释放足够上下文.
         truncated_messages, _ = self._truncate_args(
             effective_messages,
             request.system_message,
@@ -965,6 +989,7 @@ A condensed summary follows:
                 return handler(request.override(messages=truncated_messages))
             except ContextOverflowError:
                 overflow_triggered = True
+                # provider 实际窗口比估算更紧时,立即转入摘要路径并重试一次.
                 # Fallback to summarization on context overflow
 
         # Step 3: Perform summarization
@@ -979,6 +1004,7 @@ A condensed summary follows:
         # On overflow, offload the large preserved tail TM batch to per-TM files.
         new_state_tail: list[AnyMessage] = []
         if overflow_triggered:
+            # overflow 时 preserved 尾部也可能太大,先把尾部工具结果额外裁剪/落盘.
             preserved_messages, new_state_tail = _clip_overflow_tail(
                 preserved_messages,
                 backend,
@@ -1006,6 +1032,7 @@ A condensed summary follows:
         state_cutoff_index = self._compute_state_cutoff(previous_event, cutoff_index)
 
         # Create new summarization event
+        # 事件记录的是原始 state 的绝对 cutoff,后续轮次可重复重建 effective messages.
         new_event: SummarizationEvent = {
             "cutoff_index": state_cutoff_index,
             "summary_message": new_messages[0],  # The HumanMessage with summary  # ty: ignore[invalid-argument-type]
@@ -1068,6 +1095,7 @@ A condensed summary follows:
                 `_summarization_event` update is emitted.
         """
         # Get effective messages based on previous summarization events
+        # 异步路径与同步路径使用同一个事件重建逻辑,保证压缩后的上下文一致.
         effective_messages = self._get_effective_messages(request)
 
         # Step 1: Truncate args if configured
@@ -1092,6 +1120,7 @@ A condensed summary follows:
                 return await handler(request.override(messages=truncated_messages))
             except ContextOverflowError:
                 overflow_triggered = True
+                # 异步模型调用也在 overflow 后切到摘要重试,而不是把异常直接抛给上层.
                 # Fallback to summarization on context overflow
 
         # Step 3: Perform summarization
@@ -1117,6 +1146,7 @@ A condensed summary follows:
 
         # Offload to backend and generate summary concurrently -- they are independent.
         # If offload fails, summarization still proceeds (with file_path=None).
+        # 历史落盘和摘要生成互不依赖,异步路径并发执行以减少等待时间.
         file_path, summary = await asyncio.gather(
             self._aoffload_to_backend(backend, messages_to_summarize),
             self._acreate_summary(messages_to_summarize),
@@ -1225,6 +1255,7 @@ def create_summarization_middleware(
         raise TypeError(msg)
 
     defaults = compute_summarization_defaults(model)
+    # 工厂使用模型感知默认值,并关闭 LangChain 默认 trim,让 Deep Agents 自己管理历史恢复.
     return SummarizationMiddleware(
         model=model,
         backend=backend,
@@ -1555,6 +1586,7 @@ class SummarizationToolMiddleware(AgentMiddleware):
                 max_input_tokens = lc._get_profile_limits()
                 if max_input_tokens is None:
                     continue
+                # 手动 compact 约在自动阈值一半后才允许,避免过早摘要造成信息损失.
                 threshold = int(max_input_tokens * value * 0.5)
                 if threshold <= 0:
                     threshold = 1
@@ -1591,6 +1623,7 @@ class SummarizationToolMiddleware(AgentMiddleware):
             backend = self._resolve_backend(runtime)
             file_path = s._offload_to_backend(backend, to_summarize)
         except Exception as exc:  # tool must return a ToolMessage, not raise
+            # 工具调用失败要回写 ToolMessage,不能让异常破坏 tool-call 配对协议.
             logger.exception("compact_conversation tool failed")
             return self._compact_error(tool_call_id, exc)
 
@@ -1625,6 +1658,7 @@ class SummarizationToolMiddleware(AgentMiddleware):
             backend = self._resolve_backend(runtime)
             file_path = await s._aoffload_to_backend(backend, to_summarize)
         except Exception as exc:  # tool must return a ToolMessage, not raise
+            # 异步工具路径同样把失败转成 ToolMessage,保证图状态仍可继续推进.
             logger.exception("compact_conversation tool failed")
             return self._compact_error(tool_call_id, exc)
 

@@ -58,6 +58,7 @@ from deepagents.middleware.summarization import (
     create_summarization_tool_middleware,
 )
 
+# 这里集中维护 SDK 对外公开的中间件入口,避免调用方依赖内部文件路径.
 __all__ = [
     "AsyncSubAgent",
     "AsyncSubAgentMiddleware",

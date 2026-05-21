@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 def _tool_name(tool: BaseTool | dict[str, str]) -> str | None:
     """Extract tool name from a `BaseTool` or dict tool."""
+    # LangChain 工具和原始 dict schema 都可能出现在 request.tools 中,这里统一取名.
     if isinstance(tool, dict):
         name = tool.get("name")
         return name if isinstance(name, str) else None
@@ -49,6 +50,7 @@ class _ToolExclusionMiddleware(AgentMiddleware[Any, Any, Any]):
     ) -> ModelResponse[Any]:
         """Filter excluded tools before they reach the model."""
         if self._excluded:
+            # 放在中间件链后段执行:先让其他中间件注入工具,再统一剔除 profile 禁用项.
             filtered = [t for t in request.tools if _tool_name(t) not in self._excluded]
             request = request.override(tools=filtered)
         return handler(request)
@@ -60,6 +62,7 @@ class _ToolExclusionMiddleware(AgentMiddleware[Any, Any, Any]):
     ) -> ModelResponse[ResponseT] | AIMessage | ExtendedModelResponse[ResponseT]:
         """Async variant of `wrap_model_call`."""
         if self._excluded:
+            # 异步路径和同步路径保持同样的过滤语义,避免不同调用模式暴露不同工具集.
             filtered = [t for t in request.tools if _tool_name(t) not in self._excluded]
             request = request.override(tools=filtered)
         return await handler(request)

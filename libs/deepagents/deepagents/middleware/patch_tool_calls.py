@@ -17,6 +17,7 @@ class PatchToolCallsMiddleware(AgentMiddleware):
         if not messages:
             return None
 
+        # 先收集已经有 ToolMessage 回复的 tool_call_id,剩下的就是需要补洞的调用.
         answered_ids = {msg.tool_call_id for msg in messages if msg.type == "tool"}  # ty: ignore[unresolved-attribute]
 
         if not any(
@@ -37,6 +38,7 @@ class PatchToolCallsMiddleware(AgentMiddleware):
                 if tool_call_id is None or tool_call_id in answered_ids:
                     continue
                 name = tool_call["name"] or "unknown"
+                # 用合成 ToolMessage 闭合悬空调用,保证后续模型请求满足 tool call 配对约束.
                 if tool_call.get("type") == "invalid_tool_call":
                     content = f"Tool call {name} with id {tool_call_id} could not be executed - arguments were malformed or truncated."
                 else:
