@@ -224,6 +224,263 @@ class TestInterruptCleanup:
         assert interrupted_msg.tool_calls[0]["id"] == "call-1"
         assert interrupted_msg.tool_calls[0]["name"] == "read_file"
 
+    async def test_disables_tracing_during_state_save(self) -> None:
+        """Interrupt-cleanup `aupdate_state` calls must run with tracing disabled.
+
+        Interrupt state writes (partial AI message + cancellation notice) are
+        internal recovery mechanics. Surfacing them as standalone `UpdateState`
+        runs in LangSmith would add noise unrelated to user-visible agent activity.
+        """
+        from langsmith import get_tracing_context
+
+        captured: list[object] = []
+
+        async def _capture(*_args: object, **_kwargs: object) -> None:  # noqa: RUF029
+            captured.append(get_tracing_context().get("enabled"))
+
+        agent = SimpleNamespace(aupdate_state=AsyncMock(side_effect=_capture))
+        adapter = TextualUIAdapter(
+            mount_message=AsyncMock(),
+            update_status=_noop_status,
+            request_approval=_mock_approval,
+            set_spinner=AsyncMock(),
+            set_active_message=MagicMock(),
+        )
+
+        await _handle_interrupt_cleanup(
+            adapter=adapter,
+            agent=agent,
+            config={"configurable": {"thread_id": "t-1"}},
+            pending_text_by_namespace={},
+            captured_input_tokens=0,
+            captured_output_tokens=0,
+            turn_stats=SessionStats(),
+            start_time=0.0,
+        )
+
+        assert captured, "aupdate_state was never called"
+        assert all(v is False for v in captured), (
+            f"tracing was not disabled: {captured}"
+        )
+
+    async def test_disables_tracing_when_interrupted_msg_present(self) -> None:
+        """Both `aupdate_state` calls disable tracing when interrupted_msg is set.
+
+        When there is a partial AI message to save, both writes (interrupted AI
+        message and cancellation notice) must be suppressed from LangSmith traces.
+        """
+        from langsmith import get_tracing_context
+
+        captured: list[object] = []
+
+        async def _capture(*_args: object, **_kwargs: object) -> None:  # noqa: RUF029
+            captured.append(get_tracing_context().get("enabled"))
+
+        tool_widget = MagicMock()
+        tool_widget._tool_name = "read_file"
+        tool_widget._args = {"path": "notes.txt"}
+
+        agent = SimpleNamespace(aupdate_state=AsyncMock(side_effect=_capture))
+        adapter = TextualUIAdapter(
+            mount_message=AsyncMock(),
+            update_status=_noop_status,
+            request_approval=_mock_approval,
+            set_spinner=AsyncMock(),
+            set_active_message=MagicMock(),
+        )
+        adapter._current_tool_messages = {"call-1": tool_widget}
+
+        await _handle_interrupt_cleanup(
+            adapter=adapter,
+            agent=agent,
+            config={"configurable": {"thread_id": "t-1"}},
+            pending_text_by_namespace={},
+            captured_input_tokens=0,
+            captured_output_tokens=0,
+            turn_stats=SessionStats(),
+            start_time=0.0,
+        )
+
+        assert len(captured) == 2, (
+            f"expected 2 aupdate_state calls, got {len(captured)}"
+        )
+        assert all(v is False for v in captured), (
+            f"tracing was not disabled: {captured}"
+        )
+
+
+class TestInterruptCleanupTokenPersist:
+    """`_context_tokens` rides on the cancellation `aupdate_state` write."""
+
+    async def test_includes_context_tokens_in_cancellation_update(self) -> None:
+        """The cancellation HumanMessage write carries the latest token count."""
+        captured: list[dict[str, Any]] = []
+
+        async def _capture(_config: object, values: dict[str, Any]) -> None:  # noqa: RUF029
+            captured.append(values)
+
+        agent = SimpleNamespace(aupdate_state=AsyncMock(side_effect=_capture))
+        adapter = TextualUIAdapter(
+            mount_message=AsyncMock(),
+            update_status=_noop_status,
+            request_approval=_mock_approval,
+            set_spinner=AsyncMock(),
+            set_active_message=MagicMock(),
+        )
+
+        await _handle_interrupt_cleanup(
+            adapter=adapter,
+            agent=agent,
+            config={"configurable": {"thread_id": "t-1"}},
+            pending_text_by_namespace={},
+            captured_input_tokens=4321,
+            captured_output_tokens=0,
+            turn_stats=SessionStats(),
+            start_time=0.0,
+        )
+
+        # Only the cancellation write happens (no partial AI message in this test);
+        # it carries both `messages` and `_context_tokens`.
+        assert len(captured) == 1
+        assert captured[0]["_context_tokens"] == 4321
+        assert "messages" in captured[0]
+
+    async def test_omits_context_tokens_when_no_usage_captured(self) -> None:
+        """Zero tokens means we never saw `usage_metadata`; preserve the prior value."""
+        captured: list[dict[str, Any]] = []
+
+        async def _capture(_config: object, values: dict[str, Any]) -> None:  # noqa: RUF029
+            captured.append(values)
+
+        agent = SimpleNamespace(aupdate_state=AsyncMock(side_effect=_capture))
+        adapter = TextualUIAdapter(
+            mount_message=AsyncMock(),
+            update_status=_noop_status,
+            request_approval=_mock_approval,
+            set_spinner=AsyncMock(),
+            set_active_message=MagicMock(),
+        )
+
+        await _handle_interrupt_cleanup(
+            adapter=adapter,
+            agent=agent,
+            config={"configurable": {"thread_id": "t-1"}},
+            pending_text_by_namespace={},
+            captured_input_tokens=0,
+            captured_output_tokens=0,
+            turn_stats=SessionStats(),
+            start_time=0.0,
+        )
+
+        assert len(captured) == 1
+        assert "_context_tokens" not in captured[0]
+
+    async def test_includes_context_tokens_for_output_only_turn(self) -> None:
+        """Output-only AI turns (no input usage) still persist a count."""
+        captured: list[dict[str, Any]] = []
+
+        async def _capture(_config: object, values: dict[str, Any]) -> None:  # noqa: RUF029
+            captured.append(values)
+
+        agent = SimpleNamespace(aupdate_state=AsyncMock(side_effect=_capture))
+        adapter = TextualUIAdapter(
+            mount_message=AsyncMock(),
+            update_status=_noop_status,
+            request_approval=_mock_approval,
+            set_spinner=AsyncMock(),
+            set_active_message=MagicMock(),
+        )
+
+        await _handle_interrupt_cleanup(
+            adapter=adapter,
+            agent=agent,
+            config={"configurable": {"thread_id": "t-1"}},
+            pending_text_by_namespace={},
+            captured_input_tokens=0,
+            captured_output_tokens=500,
+            turn_stats=SessionStats(),
+            start_time=0.0,
+        )
+
+        assert len(captured) == 1
+        assert captured[0]["_context_tokens"] == 500
+
+    async def test_remote_agent_interrupt_write_carries_context_tokens(self) -> None:
+        """Remote agents are not skipped on the interrupt-cleanup write.
+
+        Locks in the deletion of the old `_persist_context_tokens` `RemoteAgent`
+        short-circuit so a future refactor cannot silently re-introduce it.
+        """
+        from deepagents_code.remote_client import RemoteAgent
+
+        captured: list[dict[str, Any]] = []
+
+        async def _capture(_config: object, values: dict[str, Any]) -> None:  # noqa: RUF029
+            captured.append(values)
+
+        agent = MagicMock(spec=RemoteAgent)
+        agent.aupdate_state = AsyncMock(side_effect=_capture)
+        adapter = TextualUIAdapter(
+            mount_message=AsyncMock(),
+            update_status=_noop_status,
+            request_approval=_mock_approval,
+            set_spinner=AsyncMock(),
+            set_active_message=MagicMock(),
+        )
+
+        await _handle_interrupt_cleanup(
+            adapter=adapter,
+            agent=agent,
+            config={"configurable": {"thread_id": "t-1"}},
+            pending_text_by_namespace={},
+            captured_input_tokens=1234,
+            captured_output_tokens=88,
+            turn_stats=SessionStats(),
+            start_time=0.0,
+        )
+
+        assert isinstance(agent, RemoteAgent)
+        assert len(captured) == 1
+        assert captured[0]["_context_tokens"] == 1322
+
+    async def test_partial_ai_message_write_does_not_carry_tokens(self) -> None:
+        """Only the cancellation write carries `_context_tokens`."""
+        captured: list[dict[str, Any]] = []
+
+        async def _capture(_config: object, values: dict[str, Any]) -> None:  # noqa: RUF029
+            captured.append(values)
+
+        tool_widget = MagicMock()
+        tool_widget._tool_name = "read_file"
+        tool_widget._args = {"path": "notes.txt"}
+
+        agent = SimpleNamespace(aupdate_state=AsyncMock(side_effect=_capture))
+        adapter = TextualUIAdapter(
+            mount_message=AsyncMock(),
+            update_status=_noop_status,
+            request_approval=_mock_approval,
+            set_spinner=AsyncMock(),
+            set_active_message=MagicMock(),
+        )
+        adapter._current_tool_messages = {"call-1": tool_widget}
+
+        await _handle_interrupt_cleanup(
+            adapter=adapter,
+            agent=agent,
+            config={"configurable": {"thread_id": "t-1"}},
+            pending_text_by_namespace={},
+            captured_input_tokens=7777,
+            captured_output_tokens=0,
+            turn_stats=SessionStats(),
+            start_time=0.0,
+        )
+
+        assert len(captured) == 2
+        # First write is the interrupted AI message; should not be polluted.
+        assert "_context_tokens" not in captured[0]
+        # Second write is the cancellation HumanMessage; carries the token count.
+        assert captured[1]["_context_tokens"] == 7777
+
 
 class TestBuildStreamConfig:
     """Tests for `build_stream_config` metadata construction."""
