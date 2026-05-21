@@ -242,6 +242,7 @@ class MemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
         """
         if callable(self._backend):
             # Construct an artificial tool runtime to resolve backend factory
+            # memory 与 filesystem 复用同一种 backend factory 协议,因此这里模拟 ToolRuntime.
             tool_runtime = ToolRuntime(
                 state=state,
                 context=runtime.context,
@@ -270,6 +271,7 @@ class MemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
         if not contents:
             return template.format(agent_memory="(No memory loaded)")
 
+        # 只渲染成功加载且非空的来源,并保留用户配置的 source 顺序语义.
         sections = [f"{path}\n\n{contents[path].rstrip()}" for path in self.sources if contents.get(path)]
 
         if not sections:
@@ -371,6 +373,7 @@ class MemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
         # the breakpoint correctly follows middleware-level model overrides.
         # Runs regardless of `system_prompt` so callers who suppress the
         # fragment still get the prompt-cache breakpoint they asked for.
+        # cache breakpoint 基于运行时 request.model 判断,兼容上游 middleware 替换模型.
         if (
             self._add_cache_control
             and isinstance(request.model, ChatAnthropic)
@@ -381,6 +384,7 @@ class MemoryMiddleware(AgentMiddleware[MemoryState, ContextT, ResponseT]):
             blocks: list[ContentBlock] = list(new_system_message.content_blocks)
             last = blocks[-1]
             base = last if isinstance(last, dict) else {}
+            # 保留原 content block 字段,只追加 provider-specific cache_control 元数据.
             # Merged dict is structurally a ContentBlock with an extra
             # provider-specific key; ty can't discriminate the union.
             blocks[-1] = {**base, "cache_control": {"type": "ephemeral"}}  # ty: ignore[invalid-assignment]

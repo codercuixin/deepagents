@@ -229,6 +229,7 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
         extensions don't silently inherit the alias.
         """
         if type(self) is _DeepAgentsSummarizationMiddleware:
+            # 私有实现类用公开别名参与 excluded_middleware 匹配,符合用户配置心智.
             return "SummarizationMiddleware"
         return type(self).__name__
 
@@ -527,6 +528,7 @@ A condensed summary follows:
             The effective message list to use for the model call.
         """
         event = request.state.get("_summarization_event")
+        # effective messages 是模型视图,不是 state 变更;完整消息仍保留在 state["messages"].
         return self._apply_event_to_messages(request.messages, event)
 
     @staticmethod
@@ -597,6 +599,7 @@ A condensed summary follows:
         if not isinstance(prior_cutoff, int):
             logger.warning("Malformed _summarization_event: missing cutoff_index")
             return effective_cutoff
+        # 链式摘要最容易出 off-by-one:旧 summary 占 effective[0],但不占原始 state 索引.
         # effective list 的第 0 条是虚拟摘要消息,不对应原始 state,因此映射回 state 时要减 1.
         return prior_cutoff + effective_cutoff - 1
 
@@ -753,6 +756,7 @@ A condensed summary follows:
 
                 for tool_call in msg.tool_calls:
                     if tool_call["name"] in {"write_file", "edit_file"}:
+                        # 只截会携带大文本载荷的内置写入工具,避免破坏其它工具参数语义.
                         # 当前只截断最常见的大参数来源:写文件内容和编辑补丁.
                         truncated_call = self._truncate_tool_call(tool_call)  # ty: ignore[invalid-argument-type]
                         if truncated_call != tool_call:
@@ -1004,6 +1008,7 @@ A condensed summary follows:
         # On overflow, offload the large preserved tail TM batch to per-TM files.
         new_state_tail: list[AnyMessage] = []
         if overflow_triggered:
+            # 这是 provider 真实拒绝后的二级兜底,常规摘要路径不会额外裁剪 preserved tail.
             # overflow 时 preserved 尾部也可能太大,先把尾部工具结果额外裁剪/落盘.
             preserved_messages, new_state_tail = _clip_overflow_tail(
                 preserved_messages,

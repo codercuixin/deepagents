@@ -484,9 +484,11 @@ def _build_task_tool(  # noqa: C901, PLR0915
     elif "{available_agents}" in task_description:
         description = task_description.format(available_agents=subagent_description_str)
     else:
+        # 自定义描述不含占位符时,调用方自行负责把可用 subagent 列表暴露给模型.
         description = task_description
 
     def _return_command_with_state_update(result: dict, tool_call_id: str) -> Command:
+        # 父/子状态的合并出口集中在这里,避免消息和私有 state 从多个路径回流.
         # Validate that the result contains a 'messages' key
         if "messages" not in result:
             error_msg = (

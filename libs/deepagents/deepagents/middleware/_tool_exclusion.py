@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 def _tool_name(tool: BaseTool | dict[str, str]) -> str | None:
     """Extract tool name from a `BaseTool` or dict tool."""
     # LangChain 工具和原始 dict schema 都可能出现在 request.tools 中,这里统一取名.
+    # 取不到 name 的工具会被保留;profile 级排除只能匹配明确命名的工具.
     if isinstance(tool, dict):
         name = tool.get("name")
         return name if isinstance(name, str) else None
@@ -41,6 +42,7 @@ class _ToolExclusionMiddleware(AgentMiddleware[Any, Any, Any]):
     """
 
     def __init__(self, *, excluded: frozenset[str]) -> None:
+        # excluded 来自 profile 解析后的不可变集合,运行期只读取不修改.
         self._excluded = excluded
 
     def wrap_model_call(
@@ -53,6 +55,7 @@ class _ToolExclusionMiddleware(AgentMiddleware[Any, Any, Any]):
             # 放在中间件链后段执行:先让其他中间件注入工具,再统一剔除 profile 禁用项.
             filtered = [t for t in request.tools if _tool_name(t) not in self._excluded]
             request = request.override(tools=filtered)
+        # 空排除集直接透传,减少不必要的 request.override 和工具对象重建.
         return handler(request)
 
     async def awrap_model_call(

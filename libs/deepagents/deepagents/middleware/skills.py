@@ -209,6 +209,7 @@ def _derive_source_label(source: SkillSource) -> str:
     is a programmer error but is tolerated to avoid crashing prompt
     rendering.
     """
+    # label 只影响 prompt 展示,不改变实际 backend 路径;特殊规则兼顾可读性和历史兼容.
     if isinstance(source, tuple):
         _validate_tuple_source(source)
         return source[1]
@@ -381,6 +382,7 @@ def _parse_skill_metadata(  # noqa: C901
         `SkillMetadata` if parsing succeeds, `None` if parsing fails or
             validation errors occur
     """
+    # 限制的是 SKILL.md 元数据解析输入,用于防 DoS;不限制技能目录中的辅助文件大小.
     if len(content) > MAX_SKILL_FILE_SIZE:
         logger.warning("Skipping %s: content too large (%d bytes)", skill_path, len(content))
         return None
@@ -435,6 +437,7 @@ def _parse_skill_metadata(  # noqa: C901
 
     raw_tools = frontmatter_data.get("allowed-tools")
     if isinstance(raw_tools, str):
+        # allowed-tools 是模型可见建议,不是权限 enforcement;逗号兼容 Claude Code 格式.
         allowed_tools = [
             t.strip(",")  # Support commas for compatibility with skills created for Claude Code.
             for t in raw_tools.split()
@@ -459,6 +462,7 @@ def _parse_skill_metadata(  # noqa: C901
         compatibility_str = compatibility_str[:MAX_SKILL_COMPATIBILITY_LENGTH]
 
     module_path = _validate_module_path(frontmatter_data.get("module"), skill_path)
+    # module 只作为 metadata 传递给 QuickJS/CodeInterpreter 等消费方;这里不加载也不执行.
 
     result = SkillMetadata(
         name=str(name),
@@ -675,6 +679,7 @@ def _list_skills_with_errors(backend: BackendProtocol, source_path: str) -> tupl
     """
     skills: list[SkillMetadata] = []
     source_error: str | None = None
+    # source 级错误可恢复:单个目录坏了不应让其它 source 的技能都失效.
     ls_result = backend.ls(source_path)
     if isinstance(ls_result, LsResult) and ls_result.error:
         msg = _format_skills_source_error(source_path, ls_result.error)
@@ -946,6 +951,7 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
         last = len(self.sources) - 1
 
         for i, (source_path, label) in enumerate(zip(self.sources, self.source_labels, strict=True)):
+            # higher priority 来自加载顺序的 last-one-wins,不是 backend 自身的优先级.
             suffix = " (higher priority)" if i == last else ""
             locations.append(f"**{label} Skills**: `{source_path}`{suffix}")
 
@@ -965,6 +971,7 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
                 desc_line += f" ({annotations})"
             lines.append(desc_line)
             if skill["allowed_tools"]:
+                # allowed_tools 只是给模型的使用提示,不会限制实际可见工具列表.
                 lines.append(f"  -> Allowed tools: {', '.join(skill['allowed_tools'])}")
             lines.append(f"  -> Read `{skill['path']}` for full instructions")
 
@@ -1039,6 +1046,7 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
             State update with `skills_metadata` populated, or `None` if already present.
         """
         # Skip if skills_metadata is already present in state (even if empty)
+        # 空列表也表示本会话已经扫描过 backend,不能因为没有技能就反复 I/O.
         if "skills_metadata" in state:
             return None
 
@@ -1086,6 +1094,7 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
             State update with `skills_metadata` populated, or `None` if already present.
         """
         # Skip if skills_metadata is already present in state (even if empty)
+        # 异步路径保持同样语义:空列表也是已加载完成的状态标记.
         if "skills_metadata" in state:
             return None
 

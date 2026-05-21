@@ -47,6 +47,7 @@ Use a **plain tool** when:
 * The tool is specific to a single consumer (e.g. CLI-only)
 """
 
+# 这里的导入会成为包级公开 API;新增符号前要确认愿意承担兼容性承诺.
 from deepagents.middleware.async_subagents import AsyncSubAgent, AsyncSubAgentMiddleware
 from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
 from deepagents.middleware.memory import MemoryMiddleware
@@ -59,6 +60,7 @@ from deepagents.middleware.summarization import (
 )
 
 # 这里集中维护 SDK 对外公开的中间件入口,避免调用方依赖内部文件路径.
+# 私有 helper/middleware 不放进 __all__,否则会扩大用户可依赖的稳定接口面.
 __all__ = [
     "AsyncSubAgent",
     "AsyncSubAgentMiddleware",

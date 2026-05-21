@@ -303,6 +303,7 @@ def _build_start_tool(
                 input={"messages": [{"role": "user", "content": description}]},
             )
         except Exception as e:  # noqa: BLE001  # LangGraph SDK raises untyped errors
+            # 工具错误转成模型可读字符串,避免远端启动失败破坏本轮 agent 图执行.
             logger.warning("Failed to launch async subagent '%s': %s", subagent_type, e)
             return f"Failed to launch async subagent '{subagent_type}': {e}"
         task_id = thread["thread_id"]
@@ -391,6 +392,7 @@ def _build_check_result(
         messages = thread_values.get("messages", []) if isinstance(thread_values, dict) else []
         if messages:
             last = messages[-1]
+            # 远端 graph 若需要结构化结果,应把最终消息内容设计成父 agent 可直接消费的格式.
             # 远端成功后只取最后一条消息内容作为父 agent 可消费的结果摘要.
             result["result"] = last.get("content", "") if isinstance(last, dict) else str(last)
         else:
@@ -438,6 +440,7 @@ def _resolve_tracked_task(
         The tracked `AsyncTask` on success, or an error string.
     """
     tasks: dict[str, AsyncTask] = runtime.state.get("async_tasks") or {}
+    # 只允许操作本地追踪过的 task,避免任意 thread_id 被拿来探测远端状态.
     # 用户可能复制 task_id 时带空白,查询前做轻量 normalize.
     tracked = tasks.get(task_id.strip())
     if not tracked:
@@ -698,6 +701,7 @@ def _build_cancel_tool(
 _TERMINAL_STATUSES = frozenset({"cancelled", "success", "error", "timeout", "interrupted"})
 """Task statuses that will never change, so live-status fetches can be skipped."""
 # 终态任务不再访问远端,减少 list_async_tasks 的网络开销和失败面.
+# 该集合跟随 LangGraph SDK 的 run status 约定;新增终态时需要同步更新.
 
 
 def _fetch_live_status(clients: _ClientCache, task: AsyncTask) -> str:

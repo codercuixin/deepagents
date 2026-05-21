@@ -2,6 +2,8 @@
 
 本文总结 `deepagents.middleware` 下各个实现的职责、运行时流程和主要设计取舍。
 
+更细的逐文件分析见 [`analysis/README.zh.md`](analysis/README.zh.md)。源码中的中文注释只覆盖关键边界和设计意图，完整流程说明集中放在 `analysis/` 目录。
+
 ## 总体模型
 
 Middleware 和普通工具的区别在于：普通工具只会在模型主动调用时运行，而 middleware 可以拦截模型调用前后的请求，动态调整工具列表、系统提示、消息历史和持久状态。
@@ -29,6 +31,22 @@ Middleware 和普通工具的区别在于：普通工具只会在模型主动调
 | `subagents.py` | `SubAgentMiddleware` | 提供同步 `task` 工具，启动短生命周期子 agent 并把最终结果回填父 agent。 |
 | `async_subagents.py` | `AsyncSubAgentMiddleware` | 提供远程异步 subagent 任务工具，管理启动、查询、更新、取消和列表。 |
 | `summarization.py` | `SummarizationMiddleware`, `SummarizationToolMiddleware` | 自动或手动压缩长对话，历史落盘，记录 `_summarization_event` 以重建模型上下文。 |
+
+## 逐文件分析文档
+
+- [`analysis/package_exports.zh.md`](analysis/package_exports.zh.md)：包级公开 API 和 `__all__` 边界。
+- [`analysis/utils.zh.md`](analysis/utils.zh.md)：系统提示追加 helper。
+- [`analysis/tool_exclusion.zh.md`](analysis/tool_exclusion.zh.md)：profile 级工具过滤。
+- [`analysis/permissions.zh.md`](analysis/permissions.zh.md)：权限类型兼容导出。
+- [`analysis/patch_tool_calls.zh.md`](analysis/patch_tool_calls.zh.md)：悬空 tool call 修补。
+- [`analysis/message_eviction.zh.md`](analysis/message_eviction.zh.md)：大 `ToolMessage` 落盘 helper。
+- [`analysis/overflow_clip.zh.md`](analysis/overflow_clip.zh.md)：overflow 后尾部工具结果裁剪 helper。
+- [`analysis/filesystem.zh.md`](analysis/filesystem.zh.md)：文件系统工具、权限和大内容落盘。
+- [`analysis/memory.zh.md`](analysis/memory.zh.md)：AGENTS.md 记忆加载和注入。
+- [`analysis/skills.zh.md`](analysis/skills.zh.md)：技能 metadata 扫描和渐进披露。
+- [`analysis/subagents.zh.md`](analysis/subagents.zh.md)：同步本地 subagent。
+- [`analysis/async_subagents.zh.md`](analysis/async_subagents.zh.md)：远程异步 subagent task 管理。
+- [`analysis/summarization.zh.md`](analysis/summarization.zh.md)：自动摘要和手动 compact。
 
 ## FilesystemMiddleware
 
